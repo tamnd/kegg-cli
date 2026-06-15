@@ -2,13 +2,11 @@ package kegg
 
 import (
 	"testing"
-
-	"github.com/tamnd/any-cli/kit"
 )
 
 // These tests are offline: they exercise the URI driver's pure string functions
-// and the host wiring (mint, body, resolve), which need no network. The client's
-// HTTP behaviour is covered in kegg_test.go.
+// and the domain wiring (Info, Classify, Locate). Client HTTP behaviour is
+// covered in kegg_test.go.
 
 func TestDomainInfo(t *testing.T) {
 	info := Domain{}.Info()
@@ -24,53 +22,64 @@ func TestDomainInfo(t *testing.T) {
 }
 
 func TestClassify(t *testing.T) {
-	cases := []struct{ in, typ, id string }{
-		{"wiki/Go", "page", "wiki/Go"},
-		{"/about/", "page", "about"},
-		{"https://" + Host + "/team/contact", "page", "team/contact"},
+	cases := []struct {
+		in      string
+		wantTyp string
+		wantID  string
+		wantErr bool
+	}{
+		{"C00031", "compound", "C00031", false},
+		{"C00001", "compound", "C00001", false},
+		{"https://www.kegg.jp/entry/C00031", "compound", "C00031", false},
+		{"glucose", "", "", true},   // name without C##### prefix → error
+		{"", "", "", true},
 	}
 	for _, tc := range cases {
 		typ, id, err := Domain{}.Classify(tc.in)
-		if err != nil || typ != tc.typ || id != tc.id {
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("Classify(%q): want error, got (%q, %q, nil)", tc.in, typ, id)
+			}
+			continue
+		}
+		if err != nil || typ != tc.wantTyp || id != tc.wantID {
 			t.Errorf("Classify(%q) = (%q, %q, %v), want (%q, %q, nil)",
-				tc.in, typ, id, err, tc.typ, tc.id)
+				tc.in, typ, id, err, tc.wantTyp, tc.wantID)
 		}
 	}
 }
 
 func TestLocate(t *testing.T) {
-	got, err := Domain{}.Locate("page", "wiki/Go")
-	want := "https://" + Host + "/wiki/Go"
+	got, err := Domain{}.Locate("compound", "C00031")
+	want := "https://www.kegg.jp/entry/C00031"
 	if err != nil || got != want {
 		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
 	}
+
+	_, err = Domain{}.Locate("page", "foo")
+	if err == nil {
+		t.Error("Locate(page,...): want error for unknown type")
+	}
 }
 
-// TestHostWiring mounts the driver in a kit Host (the runtime ant drives) and
-// checks the round trip: a record mints to its URI, its body is readable, and a
-// bare id resolves back to the same URI. The init in domain.go registers the
-// domain, so kit.Open finds it.
-func TestHostWiring(t *testing.T) {
-	h, err := kit.Open()
-	if err != nil {
-		t.Fatal(err)
+func TestCompoundIDRE(t *testing.T) {
+	cases := []struct {
+		s    string
+		want bool
+	}{
+		{"C00031", true},
+		{"C00001", true},
+		{"C99999", true},
+		{"glucose", false},
+		{"C0003", false},  // too short
+		{"C000310", false}, // too long
+		{"hsa:672", false},
+		{"", false},
 	}
-
-	p := &Page{ID: "wiki/Go", URL: "https://" + Host + "/wiki/Go", Title: "Go", Body: "Go is a language."}
-	u, err := h.Mint(p)
-	if err != nil {
-		t.Fatalf("Mint: %v", err)
-	}
-	if want := "kegg://page/wiki/Go"; u.String() != want {
-		t.Errorf("Mint = %q, want %q", u.String(), want)
-	}
-
-	if body, ok := h.Body(p); !ok || body == "" {
-		t.Errorf("Body = (%q, %v), want non-empty", body, ok)
-	}
-
-	got, err := h.ResolveOn("kegg", "about")
-	if err != nil || got.String() != "kegg://page/about" {
-		t.Errorf("ResolveOn = (%q, %v), want kegg://page/about", got.String(), err)
+	for _, tc := range cases {
+		got := compoundIDRE.MatchString(tc.s)
+		if got != tc.want {
+			t.Errorf("compoundIDRE.MatchString(%q) = %v, want %v", tc.s, got, tc.want)
+		}
 	}
 }

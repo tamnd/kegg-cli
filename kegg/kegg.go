@@ -1,10 +1,12 @@
 // Package kegg is the library behind the kegg command line:
-// the HTTP client, request shaping, and the typed data models for kegg.
+// the HTTP client, request shaping, and the typed data models for the
+// KEGG REST API (rest.kegg.jp).
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
 // transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// KEGG returns plain TSV text, not JSON; all parsing converts tab-separated
+// lines into the typed records below.
 package kegg
 
 import (
@@ -12,27 +14,73 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
 	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to kegg. A real, honest
+// DefaultUserAgent identifies the client to KEGG. A real, honest
 // User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "kegg/dev (+https://github.com/tamnd/kegg-cli)"
+const DefaultUserAgent = "kegg-cli/dev (+https://github.com/tamnd/kegg-cli)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at kegg.com; change it once you
-// know the real endpoints you want to read.
-const Host = "kegg.com"
+// Host is the canonical homepage used for URI driver host matching.
+const Host = "rest.kegg.jp"
 
 // BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+const BaseURL = "https://rest.kegg.jp"
 
-// Client talks to kegg over HTTP.
+// Entry is the generic record returned by the /find endpoint:
+// an id and zero or more semicolon-separated names.
+type Entry struct {
+	ID    string   `json:"id"`
+	Names []string `json:"names"`
+}
+
+// Pathway is a KEGG pathway record returned by /list/pathway.
+type Pathway struct {
+	ID   string `json:"id" kit:"id"`
+	Name string `json:"name"`
+}
+
+// Compound is a KEGG compound record (small molecule / metabolite).
+type Compound struct {
+	ID   string `json:"id" kit:"id"`
+	Name string `json:"name"` // first alias
+}
+
+// Gene is a KEGG gene entry from /find/genes.
+type Gene struct {
+	ID   string `json:"id"`   // e.g. "hsa:672"
+	Name string `json:"name"` // gene symbol(s)
+	Desc string `json:"desc"` // description after the semicolon block
+}
+
+// Config holds the tunable knobs for the client. Values of zero mean
+// "use the default".
+type Config struct {
+	BaseURL   string
+	UserAgent string
+	Rate      time.Duration // minimum gap between requests
+	Timeout   time.Duration
+	Retries   int
+}
+
+// DefaultConfig returns the recommended defaults for the KEGG free API:
+// 300 ms rate limit (polite), 15 s timeout, 3 retries.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   BaseURL,
+		UserAgent: DefaultUserAgent,
+		Rate:      300 * time.Millisecond,
+		Timeout:   15 * time.Second,
+		Retries:   3,
+	}
+}
+
+// Client talks to the KEGG REST API over HTTP.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
+	BaseURL   string
 	// Rate is the minimum gap between requests. Zero means no pacing.
 	Rate    time.Duration
 	Retries int
@@ -40,14 +88,15 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with the recommended defaults.
 func NewClient() *Client {
+	cfg := DefaultConfig()
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		HTTP:      &http.Client{Timeout: cfg.Timeout},
+		UserAgent: cfg.UserAgent,
+		BaseURL:   cfg.BaseURL,
+		Rate:      cfg.Rate,
+		Retries:   cfg.Retries,
 	}
 }
 
@@ -123,78 +172,102 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on kegg.com. It is a stand-in for the typed records you
-// will model from the real kegg endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `kegg cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
+// parseLines splits a TSV response body into rows. Each row is a slice of
+// at most two fields: the id and the rest of the line.
+func parseLines(body []byte) [][]string {
+	lines := strings.Split(strings.TrimSpace(string(body)), "\n")
+	result := make([][]string, 0, len(lines))
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		fields := strings.SplitN(line, "\t", 2)
+		result = append(result, fields)
+	}
+	return result
 }
 
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
+// FindEntries calls /find/<db>/<query> and returns the raw Entry records.
+// db is one of: compound, drug, pathway, genes, disease.
+func (c *Client) FindEntries(ctx context.Context, db, query string) ([]*Entry, error) {
+	url := c.BaseURL + "/find/" + db + "/" + query
 	body, err := c.Get(ctx, url)
 	if err != nil {
 		return nil, err
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
+	var out []*Entry
+	for _, row := range parseLines(body) {
+		e := &Entry{ID: row[0]}
+		if len(row) > 1 {
+			e.Names = strings.Split(row[1], "; ")
 		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
+		out = append(out, e)
 	}
 	return out, nil
 }
 
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
+// ListPathways calls /list/pathway/hsa and returns human pathway records.
+func (c *Client) ListPathways(ctx context.Context) ([]*Pathway, error) {
+	url := c.BaseURL + "/list/pathway/hsa"
+	body, err := c.Get(ctx, url)
+	if err != nil {
+		return nil, err
 	}
-	return out
+	var out []*Pathway
+	for _, row := range parseLines(body) {
+		p := &Pathway{ID: row[0]}
+		if len(row) > 1 {
+			p.Name = row[1]
+		}
+		out = append(out, p)
+	}
+	return out, nil
 }
 
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
+// ListCompounds calls /list/compound and returns all compound stubs.
+func (c *Client) ListCompounds(ctx context.Context) ([]*Compound, error) {
+	url := c.BaseURL + "/list/compound"
+	body, err := c.Get(ctx, url)
+	if err != nil {
+		return nil, err
 	}
-	return s
+	var out []*Compound
+	for _, row := range parseLines(body) {
+		cmp := &Compound{ID: row[0]}
+		if len(row) > 1 {
+			names := strings.SplitN(row[1], "; ", 2)
+			cmp.Name = names[0]
+		}
+		out = append(out, cmp)
+	}
+	return out, nil
+}
+
+// GetEntry calls /get/<id> and returns the raw flat-file text. KEGG flat
+// files are structured text (ENTRY / NAME / FORMULA / etc sections), not JSON.
+// The caller can parse the sections it needs; we return the whole body so
+// callers are not limited by what we pre-parse.
+func (c *Client) GetEntry(ctx context.Context, id string) ([]byte, error) {
+	url := c.BaseURL + "/get/" + id
+	return c.Get(ctx, url)
+}
+
+// GetCompound calls /get/<id> and parses the ENTRY, NAME, and FORMULA
+// sections into a Compound.
+func (c *Client) GetCompound(ctx context.Context, id string) (*Compound, error) {
+	body, err := c.GetEntry(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	cmp := &Compound{ID: id}
+	for _, line := range strings.Split(string(body), "\n") {
+		if strings.HasPrefix(line, "NAME") {
+			name := strings.TrimSpace(strings.TrimPrefix(line, "NAME"))
+			name = strings.TrimSuffix(name, ";")
+			if cmp.Name == "" {
+				cmp.Name = name
+			}
+		}
+	}
+	return cmp, nil
 }
